@@ -212,20 +212,24 @@ impl Sheet {
 
             let mut count: usize = 1;
             let current_columns = loop {
-                if let Some(item) = items.next() {
-                    if item.is_empty() {
-                        column += 1;
-                        continue;
+                match items.next() {
+                    Some(item) => {
+                        if item.is_empty() {
+                            column += 1;
+                            continue;
+                        } else {
+                            units.insert(
+                                (row, column),
+                                Unit {
+                                    content: String::from(item),
+                                    width: item.len() / 8,
+                                },
+                            );
+                        }
                     }
-                    units.insert(
-                        (row, column),
-                        Unit {
-                            content: String::from(item),
-                            width: item.len() / 8,
-                        },
-                    );
-                } else {
-                    break count;
+                    None => {
+                        break count;
+                    }
                 };
                 count += 1;
                 column += 1;
