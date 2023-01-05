@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, stdout, Read, Stdout, Write};
 
-use console::Term;
-use console::{measure_text_width, style};
+use crossterm::event::{Event, KeyCode, KeyEvent};
+use crossterm::{cursor, event, terminal, ExecutableCommand};
 
 pub struct Session {
     config: Config,
-    term: Term,
+    term: Stdout,
     mode: Mode,
     file_path: Option<String>,
     sheet: Sheet,
@@ -15,7 +15,7 @@ pub struct Session {
 
 impl Session {
     pub fn new(config: Config, args: &[String]) -> io::Result<Self> {
-        let term = Term::stdout();
+        let mut term = stdout();
         let mode = Mode::Navigate;
         let file_path = args.get(1).cloned();
         let sheet = match &file_path {
@@ -33,7 +33,8 @@ impl Session {
     }
 
     pub fn run(&mut self) -> io::Result<()> {
-        self.term.clear_screen()?;
+        self.term
+            .execute(terminal::Clear(terminal::ClearType::All))?;
         self.print()?;
 
         loop {
@@ -50,22 +51,45 @@ impl Session {
     }
 
     fn navigate(&mut self) -> io::Result<()> {
-        self.term.move_cursor_to(
-            self.sheet.active_pos.1 * self.sheet.tab_size,
-            self.sheet.active_pos.0,
-        )?;
+        self.term.execute(cursor::MoveTo(
+            (self.sheet.active_pos.1 * self.sheet.tab_size)
+                .try_into()
+                .unwrap(),
+            self.sheet.active_pos.0.try_into().unwrap(),
+        ))?;
 
-        match self.term.read_key()? {
-            console::Key::ArrowDown     => self.sheet.active_pos.0 += 1,
-            console::Key::ArrowRight    => self.sheet.active_pos.1 += 1,
-            console::Key::ArrowUp       => self.sheet.active_pos.0 -= 1,
-            console::Key::ArrowLeft     => self.sheet.active_pos.1 -= 1,
+        if let Event::Key(event) = event::read()? {
+            match event {
+                KeyEvent {
+                    code: KeyCode::Down,
+                    ..
+                } => self.sheet.active_pos.0 += 1,
+                KeyEvent {
+                    code: KeyCode::Right,
+                    ..
+                } => self.sheet.active_pos.1 += 1,
+                KeyEvent {
+                    code: KeyCode::Up, ..
+                } => self.sheet.active_pos.0 -= 1,
+                KeyEvent {
+                    code: KeyCode::Left,
+                    ..
+                } => self.sheet.active_pos.1 -= 1,
 
-            console::Key::Char(';')     => self.mode = Mode::Command,
-            console::Key::Escape        => self.mode = Mode::Exit,
-            console::Key::Enter         => self.mode = Mode::Modify,
+                KeyEvent {
+                    code: KeyCode::Char(';'),
+                    ..
+                } => self.mode = Mode::Command,
+                KeyEvent {
+                    code: KeyCode::Enter,
+                    ..
+                } => self.mode = Mode::Modify,
+                KeyEvent {
+                    code: KeyCode::Esc, ..
+                } => self.mode = Mode::Exit,
 
-            _ => todo!(),
+                _ => todo!(),
+            }
         }
 
         Ok(())
@@ -76,7 +100,9 @@ impl Session {
             Some(unit) => unit.content.to_owned(),
             None => String::new(),
         };
-        let new_buf = self.term.read_line_initial_text(&buf)?;
+        let mut new_buf = String::new();
+        io::stdin().read_line(&mut new_buf)?;
+        new_buf.pop();
 
         self.sheet
             .units
@@ -96,10 +122,10 @@ impl Session {
 
     fn command(&mut self) -> io::Result<()> {
         self.term
-            .move_cursor_to(0, (self.term.size().0 - 1).into())?;
+            .execute(cursor::MoveTo(0, terminal::size()?.0 - 1))?;
 
-        let buf = String::from(";");
-        let command = self.term.read_line_initial_text(&buf)?;
+        let mut command = String::new();
+        io::stdin().read_line(&mut command)?;
 
         self.parse_command(command)?;
 
@@ -108,14 +134,16 @@ impl Session {
         Ok(())
     }
 
-    fn print(&self) -> io::Result<()> {
+    fn print(&mut self) -> io::Result<()> {
         for unit in &self.sheet.units {
-            self.term
-                .move_cursor_to(unit.0 .1 * self.sheet.tab_size, unit.0 .0)?;
+            self.term.execute(cursor::MoveTo(
+                (unit.0.1 * self.sheet.tab_size).try_into().unwrap(),
+                unit.0.0.try_into().unwrap(),
+            ))?;
             print!(
                 "{:1$}",
-                unit.1.content,
-                measure_text_width(&unit.1.content) / self.sheet.tab_size
+                &unit.1.content,
+                &unit.1.content.len() / self.sheet.tab_size
             );
         }
 
