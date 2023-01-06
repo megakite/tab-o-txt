@@ -2,8 +2,10 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, stdout, Read, Stdout, Write};
 
+use crossterm::cursor::{MoveToNextLine, MoveToPreviousLine};
 use crossterm::event::{Event, KeyCode, KeyEvent};
-use crossterm::{cursor, event, terminal, ExecutableCommand};
+use crossterm::style::{Print, ResetColor, SetAttribute};
+use crossterm::{cursor, event, execute, style, terminal, ExecutableCommand};
 
 pub struct Session {
     config: Config,
@@ -15,11 +17,11 @@ pub struct Session {
 
 impl Session {
     pub fn new(config: Config, args: &[String]) -> io::Result<Self> {
-        let mut term = stdout();
+        let term = stdout();
         let mode = Mode::Navigate;
         let file_path = args.get(1).cloned();
         let sheet = match &file_path {
-            Some(f) => Sheet::from(f.to_owned())?,
+            Some(f) => Sheet::from_file(f.to_owned())?,
             None => Sheet::new(),
         };
 
@@ -33,17 +35,26 @@ impl Session {
     }
 
     pub fn run(&mut self) -> io::Result<()> {
-        self.term
-            .execute(terminal::Clear(terminal::ClearType::All))?;
-        self.print()?;
+        execute!(self.term, terminal::EnterAlternateScreen)?;
+
+        self.refresh()?;
 
         loop {
             match self.mode {
                 Mode::Navigate => self.navigate()?,
-                Mode::Modify => self.modify()?,
-                Mode::Command => self.command()?,
+                Mode::Edit => {
+                    self.modify()?;
+                    self.refresh()?;
+                }
+                Mode::Command => {
+                    self.command()?;
+                    self.refresh()?;
+                }
+                Mode::Quit => {
+                    self.quit()?;
 
-                Mode::Exit => break,
+                    break;
+                }
             }
         }
 
@@ -51,6 +62,10 @@ impl Session {
     }
 
     fn navigate(&mut self) -> io::Result<()> {
+        terminal::enable_raw_mode()?;
+
+        self.print()?;
+
         self.term.execute(cursor::MoveTo(
             (self.sheet.active_pos.1 * self.sheet.tab_size)
                 .try_into()
@@ -63,18 +78,18 @@ impl Session {
                 KeyEvent {
                     code: KeyCode::Down,
                     ..
-                } => self.sheet.active_pos.0 += 1,
+                } => self.sheet.move_checked(Direction::Down)?,
                 KeyEvent {
                     code: KeyCode::Right,
                     ..
-                } => self.sheet.active_pos.1 += 1,
+                } => self.sheet.move_checked(Direction::Right)?,
                 KeyEvent {
                     code: KeyCode::Up, ..
-                } => self.sheet.active_pos.0 -= 1,
+                } => self.sheet.move_checked(Direction::Up)?,
                 KeyEvent {
                     code: KeyCode::Left,
                     ..
-                } => self.sheet.active_pos.1 -= 1,
+                } => self.sheet.move_checked(Direction::Left)?,
 
                 KeyEvent {
                     code: KeyCode::Char(';'),
@@ -83,10 +98,10 @@ impl Session {
                 KeyEvent {
                     code: KeyCode::Enter,
                     ..
-                } => self.mode = Mode::Modify,
+                } => self.mode = Mode::Edit,
                 KeyEvent {
                     code: KeyCode::Esc, ..
-                } => self.mode = Mode::Exit,
+                } => self.mode = Mode::Quit,
 
                 _ => todo!(),
             }
@@ -96,23 +111,28 @@ impl Session {
     }
 
     fn modify(&mut self) -> io::Result<()> {
-        let buf = match self.sheet.units.get(&self.sheet.active_pos) {
-            Some(unit) => unit.content.to_owned(),
-            None => String::new(),
-        };
+        terminal::disable_raw_mode()?;
+
+        execute!(
+            self.term,
+            MoveToNextLine(1),
+            SetAttribute(style::Attribute::Reverse),
+            Print(" ".repeat(terminal::size()?.0.into())),
+            MoveToPreviousLine(1)
+        )?;
         let mut new_buf = String::new();
         io::stdin().read_line(&mut new_buf)?;
-        new_buf.pop();
+        execute!(self.term, ResetColor)?;
 
         self.sheet
             .units
             .entry(self.sheet.active_pos)
             .and_modify(|unit| {
-                unit.content = new_buf.to_owned();
+                unit.content = new_buf.trim().to_owned();
             })
             .or_insert(Unit {
-                content: new_buf.to_owned(),
-                width: new_buf.len() / self.sheet.tab_size,
+                content: new_buf.trim().to_owned(),
+                width: new_buf.trim().len() / self.sheet.tab_size,
             });
 
         self.mode = Mode::Navigate;
@@ -121,8 +141,9 @@ impl Session {
     }
 
     fn command(&mut self) -> io::Result<()> {
-        self.term
-            .execute(cursor::MoveTo(0, terminal::size()?.0 - 1))?;
+        terminal::disable_raw_mode()?;
+
+        self.term.execute(cursor::MoveTo(0, 0))?;
 
         let mut command = String::new();
         io::stdin().read_line(&mut command)?;
@@ -134,18 +155,36 @@ impl Session {
         Ok(())
     }
 
+    fn quit(&mut self) -> io::Result<()> {
+        terminal::disable_raw_mode()?;
+
+        execute!(self.term, terminal::LeaveAlternateScreen)?;
+
+        Ok(())
+    }
+
     fn print(&mut self) -> io::Result<()> {
         for unit in &self.sheet.units {
             self.term.execute(cursor::MoveTo(
-                (unit.0.1 * self.sheet.tab_size).try_into().unwrap(),
-                unit.0.0.try_into().unwrap(),
+                (unit.0 .1 * self.sheet.tab_size).try_into().unwrap(),
+                unit.0 .0.try_into().unwrap(),
             ))?;
             print!(
                 "{:1$}",
                 &unit.1.content,
-                &unit.1.content.len() / self.sheet.tab_size
+                &unit.1.content.len() / (self.sheet.tab_size + 1)
             );
         }
+
+        Ok(())
+    }
+
+    fn refresh(&mut self) -> io::Result<()> {
+        terminal::disable_raw_mode()?;
+
+        execute!(self.term, terminal::Clear(terminal::ClearType::All))?;
+
+        self.print()?;
 
         Ok(())
     }
@@ -154,7 +193,9 @@ impl Session {
         if command.is_empty() {
             return Ok(());
         }
+
         self.save()?;
+
         Ok(())
     }
 
@@ -172,7 +213,7 @@ impl Session {
         let mut file = File::options().create(true).write(true).open(file_path)?;
 
         for row in 0..self.sheet.rows {
-            for column in 0..self.sheet.columns {
+            for column in 0..self.sheet.cols {
                 file.write(match self.sheet.units.get(&(row, column)) {
                     Some(unit) => unit.content.as_bytes(),
                     None => b"",
@@ -198,7 +239,7 @@ impl Config {
 struct Sheet {
     units: HashMap<(usize, usize), Unit>,
     rows: usize,
-    columns: usize,
+    cols: usize,
     tab_size: usize,
     active_pos: (usize, usize),
 }
@@ -208,24 +249,52 @@ impl Sheet {
         Self {
             units: HashMap::new(),
             rows: 1,
-            columns: 1,
+            cols: 1,
             tab_size: 8,
             active_pos: (0, 0),
         }
     }
 
-    fn from(path: String) -> io::Result<Self> {
+    fn move_checked(&mut self, dir: Direction) -> io::Result<()> {
+        match dir {
+            Direction::Down => {
+                if self.active_pos.0 != self.rows - 1 {
+                    self.active_pos.0 += 1
+                }
+            }
+            Direction::Right => {
+                if self.active_pos.1 != self.cols - 1 {
+                    self.active_pos.1 += 1
+                }
+            }
+            Direction::Up => {
+                if self.active_pos.0 != 0 {
+                    self.active_pos.0 -= 1
+                }
+            }
+            Direction::Left => {
+                if self.active_pos.1 != 0 {
+                    self.active_pos.1 -= 1
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn from_file(path: String) -> io::Result<Self> {
         let mut file = File::options().read(true).write(true).open(path)?;
         let mut buf = String::new();
         file.read_to_string(&mut buf)?;
 
-        Ok(Self::parse(buf))
+        Ok(Self::from_string(buf))
     }
 
-    fn parse(buf: String) -> Self {
+    fn from_string(buf: String) -> Self {
         let mut units = HashMap::new();
+
         let mut rows: usize = 1;
-        let mut columns: usize = 1;
+        let mut cols: usize = 1;
 
         let mut row: usize = 0;
         let mut lines = buf.lines();
@@ -240,24 +309,21 @@ impl Sheet {
 
             let mut count: usize = 1;
             let current_columns = loop {
-                match items.next() {
-                    Some(item) => {
-                        if item.is_empty() {
-                            column += 1;
-                            continue;
-                        } else {
-                            units.insert(
-                                (row, column),
-                                Unit {
-                                    content: String::from(item),
-                                    width: item.len() / 8,
-                                },
-                            );
-                        }
+                if let Some(item) = items.next() {
+                    if item.is_empty() {
+                        column += 1;
+                        continue;
+                    } else {
+                        units.insert(
+                            (row, column),
+                            Unit {
+                                content: String::from(item),
+                                width: item.len() / 8,
+                            },
+                        );
                     }
-                    None => {
-                        break count;
-                    }
+                } else {
+                    break count;
                 };
                 count += 1;
                 column += 1;
@@ -265,15 +331,15 @@ impl Sheet {
             row += 1;
             rows += 1;
 
-            if columns < current_columns {
-                columns = current_columns;
+            if cols < current_columns {
+                cols = current_columns;
             }
         }
 
         Self {
             units,
             rows,
-            columns,
+            cols,
             tab_size: 8,
             active_pos: (0, 0),
         }
@@ -287,7 +353,14 @@ struct Unit {
 
 enum Mode {
     Navigate,
-    Modify,
+    Edit,
     Command,
-    Exit,
+    Quit,
+}
+
+enum Direction {
+    Down,
+    Right,
+    Up,
+    Left,
 }
