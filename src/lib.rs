@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::cmp::max;
+use std::collections::{HashMap, LinkedList};
 use std::fs::File;
 use std::io::{self, stdout, Read, Stdout, Write};
 
@@ -8,7 +9,6 @@ use crossterm::style::{Print, ResetColor, SetAttribute};
 use crossterm::{cursor, event, execute, style, terminal, ExecutableCommand};
 
 pub struct Session {
-    config: Config,
     term: Stdout,
     mode: Mode,
     file_path: Option<String>,
@@ -21,12 +21,11 @@ impl Session {
         let mode = Mode::Navigate;
         let file_path = args.get(1).cloned();
         let sheet = match &file_path {
-            Some(f) => Sheet::from_file(f.to_owned())?,
+            Some(f) => Sheet::from_file(f, config)?,
             None => Sheet::new(),
         };
 
         Ok(Self {
-            config,
             term,
             mode,
             file_path,
@@ -113,26 +112,27 @@ impl Session {
     fn modify(&mut self) -> io::Result<()> {
         terminal::disable_raw_mode()?;
 
+        let mut buf = match self.sheet.units.get(&self.sheet.active_pos) {
+            Some(unit) => unit.content.to_owned(),
+            None => String::new(),
+        };
         execute!(
             self.term,
-            MoveToNextLine(1),
             SetAttribute(style::Attribute::Reverse),
-            Print(" ".repeat(terminal::size()?.0.into())),
-            MoveToPreviousLine(1)
+            Print(&buf),
         )?;
-        let mut new_buf = String::new();
-        io::stdin().read_line(&mut new_buf)?;
+        io::stdin().read_line(&mut buf)?;
         execute!(self.term, ResetColor)?;
 
         self.sheet
             .units
             .entry(self.sheet.active_pos)
             .and_modify(|unit| {
-                unit.content = new_buf.trim().to_owned();
+                unit.content = buf.trim().to_owned();
             })
             .or_insert(Unit {
-                content: new_buf.trim().to_owned(),
-                width: new_buf.trim().len() / self.sheet.tab_size,
+                content: buf.trim().to_owned(),
+                width: buf.len() / self.sheet.tab_size + 1,
             });
 
         self.mode = Mode::Navigate;
@@ -148,7 +148,7 @@ impl Session {
         let mut command = String::new();
         io::stdin().read_line(&mut command)?;
 
-        self.parse_command(command)?;
+        self.parse_command(&command)?;
 
         self.mode = Mode::Navigate;
 
@@ -166,15 +166,18 @@ impl Session {
     fn print(&mut self) -> io::Result<()> {
         for unit in &self.sheet.units {
             self.term.execute(cursor::MoveTo(
-                (unit.0 .1 * self.sheet.tab_size).try_into().unwrap(),
-                unit.0 .0.try_into().unwrap(),
+                (self.sheet.tab_size * unit.0.1)
+                    .try_into()
+                    .unwrap(),
+                unit.0.0.try_into().unwrap(),
             ))?;
             print!(
                 "{:1$}",
                 &unit.1.content,
-                &unit.1.content.len() / (self.sheet.tab_size + 1)
+                &unit.1.width * self.sheet.tab_size,
             );
         }
+        dbg!(&self.sheet.units);
 
         Ok(())
     }
@@ -189,7 +192,7 @@ impl Session {
         Ok(())
     }
 
-    fn parse_command(&mut self, command: String) -> io::Result<()> {
+    fn parse_command(&mut self, command: &str) -> io::Result<()> {
         if command.is_empty() {
             return Ok(());
         }
@@ -226,13 +229,27 @@ impl Session {
         Ok(())
     }
 }
+
 pub struct Config {
-    tab_size: usize,
+    default_tab_size: usize,
+    indent_type: IndentType,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            default_tab_size: 8,
+            indent_type: IndentType::Tab,
+        }
+    }
 }
 
 impl Config {
     pub fn build(vars: &[(String, String)]) -> Result<Self, &'static str> {
-        Ok(Self { tab_size: 8 })
+        Ok(Self {
+            default_tab_size: 8,
+            indent_type: IndentType::Tab,
+        })
     }
 }
 
@@ -282,70 +299,83 @@ impl Sheet {
         Ok(())
     }
 
-    fn from_file(path: String) -> io::Result<Self> {
-        let mut file = File::options().read(true).write(true).open(path)?;
+    fn from_file(path: &str, config: Config) -> io::Result<Self> {
         let mut buf = String::new();
-        file.read_to_string(&mut buf)?;
+        File::options()
+            .read(true)
+            .write(true)
+            .open(path)?
+            .read_to_string(&mut buf)?;
 
-        Ok(Self::from_string(buf))
+        Ok(Self::from_str(&buf, config))
     }
 
-    fn from_string(buf: String) -> Self {
+    fn from_str(buf: &str, config: Config) -> Self {
+        let mut contents: Vec<Vec<&str>> = vec![];
+
+        let mut lines = buf.lines();
+        while let Some(ln) = lines.next() {
+            contents.push(ln.split('\t').collect());
+        }
+
+        let orig_cols = contents.iter().map(|c| c.len()).max().unwrap();
+        let orig_rows = contents.len();
+
         let mut units = HashMap::new();
 
-        let mut rows: usize = 1;
-        let mut cols: usize = 1;
+        let mut positions: Vec<(usize, usize)> = vec![];
 
-        let mut row: usize = 0;
-        let mut lines = buf.lines();
-        loop {
-            let mut column: usize = 0;
-            let mut items = match lines.next() {
-                Some(line) => line.split('\t'),
-                None => {
-                    break;
+        for (i, ln) in contents.iter().enumerate() {
+            let mut current_hpos: usize = 0;
+            for item in ln {
+                if (*item).is_empty() {
+                    current_hpos += 1;
+                    continue;
                 }
-            };
 
-            let mut count: usize = 1;
-            let current_columns = loop {
-                if let Some(item) = items.next() {
-                    if item.is_empty() {
-                        column += 1;
-                        continue;
-                    } else {
-                        units.insert(
-                            (row, column),
-                            Unit {
-                                content: String::from(item),
-                                width: item.len() / 8,
-                            },
-                        );
-                    }
+                positions.push((i, current_hpos));
+
+                current_hpos += item.len() / config.default_tab_size + 1;
+            }
+        }
+
+        dbg!(&positions);
+        let mut idx: usize = 0;
+        for ln in contents {
+            for col in ln {
+                if col.is_empty() {
+                    continue;
+                }
+
+                let width = if positions.get(idx + 1).unwrap_or(&(0, 0)).0 == positions[idx].0 {
+                    positions[idx + 1].1 - positions[idx].1
                 } else {
-                    break count;
+                    col.len() / config.default_tab_size + 1
                 };
-                count += 1;
-                column += 1;
-            };
-            row += 1;
-            rows += 1;
 
-            if cols < current_columns {
-                cols = current_columns;
+                units.insert(
+                    (positions[idx].0, positions[idx].1),
+                    Unit {
+                        content: col.to_owned(),
+                        width,
+                    },
+                );
+
+                idx += 1;
             }
         }
 
         Self {
             units,
-            rows,
-            cols,
-            tab_size: 8,
+            rows: orig_rows,
+            cols: orig_cols,
+            tab_size: config.default_tab_size,
             active_pos: (0, 0),
         }
     }
 }
 
+#[derive(Debug)]
 struct Unit {
     content: String,
     width: usize,
@@ -363,4 +393,10 @@ enum Direction {
     Right,
     Up,
     Left,
+}
+
+enum IndentType {
+    Tab,
+    Space,
+    Em,
 }

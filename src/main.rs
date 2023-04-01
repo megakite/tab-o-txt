@@ -1,8 +1,7 @@
 use std::env;
 use std::process;
 
-use tab_o_txt::Config;
-use tab_o_txt::Session;
+use tab_o_txt::*;
 
 fn main() {
     let vars: Vec<_> = env::vars().collect();
