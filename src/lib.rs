@@ -1,9 +1,7 @@
-use std::cmp::max;
-use std::collections::{HashMap, LinkedList};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, stdout, Read, Stdout, Write};
 
-use crossterm::cursor::{MoveToNextLine, MoveToPreviousLine};
 use crossterm::event::{Event, KeyCode, KeyEvent};
 use crossterm::style::{Print, ResetColor, SetAttribute};
 use crossterm::{cursor, event, execute, style, terminal, ExecutableCommand};
@@ -166,10 +164,8 @@ impl Session {
     fn print(&mut self) -> io::Result<()> {
         for unit in &self.sheet.units {
             self.term.execute(cursor::MoveTo(
-                (self.sheet.tab_size * unit.0.1)
-                    .try_into()
-                    .unwrap(),
-                unit.0.0.try_into().unwrap(),
+                (self.sheet.tab_size * unit.0 .1).try_into().unwrap(),
+                unit.0 .0.try_into().unwrap(),
             ))?;
             print!(
                 "{:1$}",
@@ -233,15 +229,6 @@ impl Session {
 pub struct Config {
     default_tab_size: usize,
     indent_type: IndentType,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            default_tab_size: 8,
-            indent_type: IndentType::Tab,
-        }
-    }
 }
 
 impl Config {
@@ -322,48 +309,15 @@ impl Sheet {
         let orig_rows = contents.len();
 
         let mut units = HashMap::new();
+        let widths: Vec<usize> = get_width_from_contents(contents, config.default_tab_size);
 
-        let mut positions: Vec<(usize, usize)> = vec![];
-
-        for (i, ln) in contents.iter().enumerate() {
-            let mut current_hpos: usize = 0;
-            for item in ln {
-                if (*item).is_empty() {
-                    current_hpos += 1;
-                    continue;
-                }
-
-                positions.push((i, current_hpos));
-
-                current_hpos += item.len() / config.default_tab_size + 1;
-            }
-        }
-
-        dbg!(&positions);
-        let mut idx: usize = 0;
-        for ln in contents {
-            for col in ln {
-                if col.is_empty() {
-                    continue;
-                }
-
-                let width = if positions.get(idx + 1).unwrap_or(&(0, 0)).0 == positions[idx].0 {
-                    positions[idx + 1].1 - positions[idx].1
-                } else {
-                    col.len() / config.default_tab_size + 1
-                };
-
-                units.insert(
-                    (positions[idx].0, positions[idx].1),
-                    Unit {
-                        content: col.to_owned(),
-                        width,
-                    },
-                );
-
-                idx += 1;
-            }
-        }
+        units.insert(
+            (0, 0),
+            Unit {
+                content: String::new(),
+                width: 1,
+            },
+        );
 
         Self {
             units,
@@ -373,6 +327,63 @@ impl Sheet {
             active_pos: (0, 0),
         }
     }
+}
+
+fn get_width_from_contents(contents: Vec<Vec<&str>>, tab_size: usize) -> Vec<usize> {
+    let mut widths: Vec<usize> = vec![];
+
+    let mut lines = contents.iter();
+    if let Some(first_line) = lines.next() {
+        let mut iter = first_line.iter();
+        let mut width_unit: usize = 0;
+
+        while let Some(s) = iter.next() {
+            if s.is_empty() {
+                width_unit += 1;
+            } else {
+                if width_unit != 0 {
+                    widths.push(width_unit);
+                }
+                width_unit = s.len() / tab_size + 1;
+            }
+        }
+        widths.push(width_unit);
+    }
+
+    while let Some(line) = lines.next() {
+        let mut width: usize = 0;
+        let mut col: usize = 0;
+
+        let mut items = line.iter();
+        while let Some(s) = items.next() {
+            if s.is_empty() {
+                width += 1;
+            } else {
+                if width != 0 {
+                    if let Some(n) = widths.get(col) {
+                        if width > *n {
+                            let diff = width - *n;
+                            col += diff;
+                        }
+                    } else {
+                        widths.push(width);
+                    }
+                    col += 1;
+                }
+                width = s.len() / tab_size + 1;
+            }
+        }
+
+        if col == widths.len() - 1 && width > widths[col] {
+            widths[col] = width;
+        }
+    
+        if col > widths.len() - 1 {
+            widths.push(width);
+        }
+    }
+
+    return widths;
 }
 
 #[derive(Debug)]
