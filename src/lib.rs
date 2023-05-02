@@ -2,9 +2,11 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, stdout, Read, Stdout, Write};
 
-use crossterm::event::{Event, KeyCode, KeyEvent};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::style::{Print, ResetColor, SetAttribute};
 use crossterm::{cursor, event, execute, style, terminal, ExecutableCommand};
+
+use unicode_width::UnicodeWidthStr;
 
 pub struct Session {
     term: Stdout,
@@ -64,7 +66,7 @@ impl Session {
         self.print()?;
 
         self.term.execute(cursor::MoveTo(
-            (self.sheet.active_pos.1 * self.sheet.tab_size)
+            (self.sheet.accumulated_widths[self.sheet.active_pos.1] * self.sheet.tab_size)
                 .try_into()
                 .unwrap(),
             self.sheet.active_pos.0.try_into().unwrap(),
@@ -73,34 +75,47 @@ impl Session {
         if let Event::Key(event) = event::read()? {
             match event {
                 KeyEvent {
+                    code: KeyCode::Up, ..
+                }
+                | KeyEvent {
+                    code: KeyCode::Enter,
+                    modifiers: KeyModifiers::SHIFT,
+                    ..
+                } => self.sheet.move_checked(Direction::Up)?,
+                KeyEvent {
+                    code: KeyCode::Left,
+                    ..
+                }
+                | KeyEvent {
+                    code: KeyCode::Tab,
+                    modifiers: KeyModifiers::SHIFT,
+                    ..
+                } => self.sheet.move_checked(Direction::Left)?,
+                KeyEvent {
                     code: KeyCode::Down,
+                    ..
+                }
+                | KeyEvent {
+                    code: KeyCode::Enter,
                     ..
                 } => self.sheet.move_checked(Direction::Down)?,
                 KeyEvent {
                     code: KeyCode::Right,
                     ..
+                }
+                | KeyEvent {
+                    code: KeyCode::Tab, ..
                 } => self.sheet.move_checked(Direction::Right)?,
-                KeyEvent {
-                    code: KeyCode::Up, ..
-                } => self.sheet.move_checked(Direction::Up)?,
-                KeyEvent {
-                    code: KeyCode::Left,
-                    ..
-                } => self.sheet.move_checked(Direction::Left)?,
 
                 KeyEvent {
-                    code: KeyCode::Char(';'),
+                    code: KeyCode::Char(':'),
                     ..
                 } => self.mode = Mode::Command,
-                KeyEvent {
-                    code: KeyCode::Enter,
-                    ..
-                } => self.mode = Mode::Edit,
                 KeyEvent {
                     code: KeyCode::Esc, ..
                 } => self.mode = Mode::Quit,
 
-                _ => todo!(),
+                _ => self.mode = Mode::Edit,
             }
         }
 
@@ -130,7 +145,6 @@ impl Session {
             })
             .or_insert(Unit {
                 content: buf.trim().to_owned(),
-                width: buf.len() / self.sheet.tab_size + 1,
             });
 
         self.mode = Mode::Navigate;
@@ -164,16 +178,13 @@ impl Session {
     fn print(&mut self) -> io::Result<()> {
         for unit in &self.sheet.units {
             self.term.execute(cursor::MoveTo(
-                (self.sheet.tab_size * unit.0 .1).try_into().unwrap(),
-                unit.0 .0.try_into().unwrap(),
+                (self.sheet.accumulated_widths[unit.0 .1] * self.sheet.tab_size)
+                    .try_into()
+                    .unwrap(),
+                (unit.0 .0).try_into().unwrap(),
             ))?;
-            print!(
-                "{:1$}",
-                &unit.1.content,
-                &unit.1.width * self.sheet.tab_size,
-            );
+            print!("{:1}", unit.1.content);
         }
-        dbg!(&self.sheet.units);
 
         Ok(())
     }
@@ -212,14 +223,15 @@ impl Session {
         let mut file = File::options().create(true).write(true).open(file_path)?;
 
         for row in 0..self.sheet.rows {
-            for column in 0..self.sheet.cols {
-                file.write(match self.sheet.units.get(&(row, column)) {
-                    Some(unit) => unit.content.as_bytes(),
-                    None => b"",
-                })?;
-                file.write(b"\t")?;
+            for col in 0..self.sheet.cols {
+                if let Some(u) = self.sheet.units.get(&(row, col)) {
+                    file.write_all(u.content.as_bytes())?;
+
+                    let width = u.content.len() / self.sheet.tab_size + 1;
+                    file.write_all(&b"\t".repeat(self.sheet.widths[col] - width + 1))?;
+                };
             }
-            file.write(b"\n")?;
+            file.write_all(b"\n")?;
         }
 
         Ok(())
@@ -246,6 +258,8 @@ struct Sheet {
     cols: usize,
     tab_size: usize,
     active_pos: (usize, usize),
+    widths: Vec<usize>,
+    accumulated_widths: Vec<usize>,
 }
 
 impl Sheet {
@@ -256,6 +270,8 @@ impl Sheet {
             cols: 1,
             tab_size: 8,
             active_pos: (0, 0),
+            widths: vec![],
+            accumulated_widths: vec![0],
         }
     }
 
@@ -300,96 +316,108 @@ impl Sheet {
     fn from_str(buf: &str, config: Config) -> Self {
         let mut contents: Vec<Vec<&str>> = vec![];
 
-        let mut lines = buf.lines();
-        while let Some(ln) = lines.next() {
-            contents.push(ln.split('\t').collect());
+        let lines = buf.lines();
+        for line in lines {
+            contents.push(line.split('\t').collect());
         }
 
-        let orig_cols = contents.iter().map(|c| c.len()).max().unwrap();
-        let orig_rows = contents.len();
+        let mut units_map = HashMap::new();
+        let (widths, accumulated_widths) =
+            get_col_widths_from_contents(&contents, config.default_tab_size);
 
-        let mut units = HashMap::new();
-        let widths: Vec<usize> = get_width_from_contents(contents, config.default_tab_size);
+        let rows = contents.len();
+        let cols = widths.len();
 
-        units.insert(
-            (0, 0),
-            Unit {
-                content: String::new(),
-                width: 1,
-            },
-        );
+        let mut row: usize = 0;
+        for line in contents {
+            let mut col: usize = 0;
+            let mut units = line.into_iter();
+            while let Some(s) = units.next() {
+                units_map.insert(
+                    (row, col),
+                    Unit {
+                        content: String::from(s),
+                    },
+                );
+
+                let width = s.len() / config.default_tab_size + 1;
+                let diff = widths[col] - width;
+                if diff > 0 {
+                    units.nth(diff - 1);
+                }
+
+                col += 1;
+            }
+
+            row += 1;
+        }
 
         Self {
-            units,
-            rows: orig_rows,
-            cols: orig_cols,
+            units: units_map,
+            rows,
+            cols,
             tab_size: config.default_tab_size,
             active_pos: (0, 0),
+            widths,
+            accumulated_widths,
         }
     }
 }
 
-fn get_width_from_contents(contents: Vec<Vec<&str>>, tab_size: usize) -> Vec<usize> {
+fn get_col_widths_from_contents(
+    contents: &[Vec<&str>],
+    tab_size: usize,
+) -> (Vec<usize>, Vec<usize>) {
     let mut widths: Vec<usize> = vec![];
+    let mut accumulated_widths: Vec<usize> = vec![0];
 
-    let mut lines = contents.iter();
-    if let Some(first_line) = lines.next() {
-        let mut iter = first_line.iter();
-        let mut width_unit: usize = 0;
-
-        while let Some(s) = iter.next() {
-            if s.is_empty() {
-                width_unit += 1;
-            } else {
-                if width_unit != 0 {
-                    widths.push(width_unit);
-                }
-                width_unit = s.len() / tab_size + 1;
-            }
-        }
-        widths.push(width_unit);
-    }
-
-    while let Some(line) = lines.next() {
+    let lines = contents.iter();
+    for line in lines {
         let mut width: usize = 0;
         let mut col: usize = 0;
+        let indent = true;
 
-        let mut items = line.iter();
-        while let Some(s) = items.next() {
+        let units = line.iter();
+        for s in units {
             if s.is_empty() {
                 width += 1;
             } else {
                 if width != 0 {
                     if let Some(n) = widths.get(col) {
                         if width > *n {
-                            let diff = width - *n;
-                            col += diff;
+                            let delta = width - *n;
+                            col += delta;
                         }
                     } else {
                         widths.push(width);
+                        accumulated_widths.push(width + accumulated_widths[col]);
                     }
+
                     col += 1;
                 }
-                width = s.len() / tab_size + 1;
+
+                let unicode_width = UnicodeWidthStr::width(*s);
+                width = unicode_width / tab_size + 1;
             }
         }
 
         if col == widths.len() - 1 && width > widths[col] {
             widths[col] = width;
+            accumulated_widths[col + 1] = width + accumulated_widths[col];
         }
-    
-        if col > widths.len() - 1 {
+
+        if col == widths.len() {
             widths.push(width);
+            accumulated_widths.push(width + accumulated_widths[col]);
         }
     }
 
-    return widths;
+    (widths, accumulated_widths)
 }
 
 #[derive(Debug)]
 struct Unit {
     content: String,
-    width: usize,
 }
 
 enum Mode {
