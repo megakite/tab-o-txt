@@ -66,7 +66,7 @@ impl Session {
         self.print()?;
 
         self.term.execute(cursor::MoveTo(
-            (self.sheet.accumulated_widths[self.sheet.active_pos.1] * self.sheet.tab_size)
+            (self.sheet.accum_widths[self.sheet.active_pos.1] * self.sheet.tab_size)
                 .try_into()
                 .unwrap(),
             self.sheet.active_pos.0.try_into().unwrap(),
@@ -178,7 +178,7 @@ impl Session {
     fn print(&mut self) -> io::Result<()> {
         for unit in &self.sheet.units {
             self.term.execute(cursor::MoveTo(
-                (self.sheet.accumulated_widths[unit.0 .1] * self.sheet.tab_size)
+                (self.sheet.accum_widths[unit.0 .1] * self.sheet.tab_size)
                     .try_into()
                     .unwrap(),
                 (unit.0 .0).try_into().unwrap(),
@@ -239,16 +239,12 @@ impl Session {
 }
 
 pub struct Config {
-    default_tab_size: usize,
-    indent_type: IndentType,
+    tab_size: usize,
 }
 
 impl Config {
-    pub fn build(vars: &[(String, String)]) -> Result<Self, &'static str> {
-        Ok(Self {
-            default_tab_size: 8,
-            indent_type: IndentType::Tab,
-        })
+    pub fn new() -> Self {
+        Self { tab_size: 8 }
     }
 }
 
@@ -259,7 +255,7 @@ struct Sheet {
     tab_size: usize,
     active_pos: (usize, usize),
     widths: Vec<usize>,
-    accumulated_widths: Vec<usize>,
+    accum_widths: Vec<usize>,
 }
 
 impl Sheet {
@@ -271,7 +267,7 @@ impl Sheet {
             tab_size: 8,
             active_pos: (0, 0),
             widths: vec![],
-            accumulated_widths: vec![0],
+            accum_widths: vec![0],
         }
     }
 
@@ -322,8 +318,7 @@ impl Sheet {
         }
 
         let mut units_map = HashMap::new();
-        let (widths, accumulated_widths) =
-            get_col_widths_from_contents(&contents, config.default_tab_size);
+        let (widths, accum_widths) = get_col_widths_from_contents(&contents, config.tab_size);
 
         let rows = contents.len();
         let cols = widths.len();
@@ -331,8 +326,8 @@ impl Sheet {
         let mut row: usize = 0;
         for line in contents {
             let mut col: usize = 0;
-            let mut units = line.into_iter();
-            while let Some(s) = units.next() {
+            let mut items = line.into_iter();
+            while let Some(s) = items.next() {
                 units_map.insert(
                     (row, col),
                     Unit {
@@ -340,10 +335,10 @@ impl Sheet {
                     },
                 );
 
-                let width = s.len() / config.default_tab_size + 1;
-                let diff = widths[col] - width;
+                let width = UnicodeWidthStr::width(s) / config.tab_size + 1;
+                let diff = widths[col].checked_sub(width).unwrap_or_default();
                 if diff > 0 {
-                    units.nth(diff - 1);
+                    items.nth(diff - 1);
                 }
 
                 col += 1;
@@ -356,10 +351,10 @@ impl Sheet {
             units: units_map,
             rows,
             cols,
-            tab_size: config.default_tab_size,
+            tab_size: config.tab_size,
             active_pos: (0, 0),
             widths,
-            accumulated_widths,
+            accum_widths,
         }
     }
 }
@@ -369,50 +364,48 @@ fn get_col_widths_from_contents(
     tab_size: usize,
 ) -> (Vec<usize>, Vec<usize>) {
     let mut widths: Vec<usize> = vec![];
-    let mut accumulated_widths: Vec<usize> = vec![0];
 
-    let lines = contents.iter();
-    for line in lines {
-        let mut width: usize = 0;
-        let mut col: usize = 0;
-        let indent = true;
+    for line in contents {
+        let mut index: usize = 0;
+        let mut items = line.iter().peekable();
 
-        let units = line.iter();
-        for s in units {
-            if s.is_empty() {
-                width += 1;
-            } else {
-                if width != 0 {
-                    if let Some(n) = widths.get(col) {
-                        if width > *n {
-                            let delta = width - *n;
-                            col += delta;
-                        }
-                    } else {
-                        widths.push(width);
-                        accumulated_widths.push(width + accumulated_widths[col]);
-                    }
+        'l: while let Some(item) = items.next() {
+            let mut width: usize = UnicodeWidthStr::width(*item) / tab_size + 1;
 
-                    col += 1;
+            while let Some(following) = items.peek() {
+                if (**following).is_empty() {
+                    items.next();
+                    width += 1;
+                } else {
+                    break;
                 }
-
-                let unicode_width = UnicodeWidthStr::width(*s);
-                width = unicode_width / tab_size + 1;
             }
-        }
 
-        if col == widths.len() - 1 && width > widths[col] {
-            widths[col] = width;
-            accumulated_widths[col + 1] = width + accumulated_widths[col];
-        }
+            while let Some(prev_width) = widths.get(index) {
+                if width.checked_sub(*prev_width).unwrap_or_default() > 0 {
+                    if index == widths.len() - 1 {
+                        widths[index] = width;
+                    } else {
+                        width -= prev_width;
+                        index += 1;
+                    }
+                } else {
+                    index += 1;
+                    continue 'l;
+                }
+            }
 
-        if col == widths.len() {
             widths.push(width);
-            accumulated_widths.push(width + accumulated_widths[col]);
+            index += 1;
         }
     }
 
-    (widths, accumulated_widths)
+    let mut accum_widths = vec![0];
+    for i in 0..widths.len() {
+        accum_widths.push(widths[i] + accum_widths[i]);
+    }
+
+    (widths, accum_widths)
 }
 
 #[derive(Debug)]
@@ -432,10 +425,4 @@ enum Direction {
     Right,
     Up,
     Left,
-}
-
-enum IndentType {
-    Tab,
-    Space,
-    Em,
 }

@@ -4,11 +4,7 @@ use std::process;
 use tab_o_txt::*;
 
 fn main() {
-    let vars: Vec<_> = env::vars().collect();
-    let config = Config::build(&vars).unwrap_or_else(|err| {
-        println!("Problem parsing environment variables: {}", err);
-        process::exit(1);
-    });
+    let config = Config::new();
 
     let args: Vec<_> = env::args().collect();
     let mut session = Session::new(config, &args).unwrap_or_else(|err| {
