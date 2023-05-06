@@ -13,6 +13,8 @@ pub struct Session {
     mode: Mode,
     file_path: Option<String>,
     sheet: Sheet,
+    pos: (usize, usize),
+    corner: (usize, usize),
 }
 
 impl Session {
@@ -22,7 +24,7 @@ impl Session {
         let file_path = args.get(1).cloned();
         let sheet = match &file_path {
             Some(f) => Sheet::from_file(f, config)?,
-            None => Sheet::new(),
+            None => Sheet::new(config),
         };
 
         Ok(Self {
@@ -30,26 +32,32 @@ impl Session {
             mode,
             file_path,
             sheet,
+            pos: (0, 0),
+            corner: (0, 0),
         })
     }
 
     pub fn run(&mut self) -> io::Result<()> {
         execute!(self.term, terminal::EnterAlternateScreen)?;
 
-        self.refresh()?;
-
         loop {
             match self.mode {
-                Mode::Navigate => self.navigate()?,
+                Mode::Navigate => {
+                    terminal::enable_raw_mode()?;
+                    self.navigate()?;
+                }
                 Mode::Edit => {
+                    terminal::disable_raw_mode()?;
                     self.modify()?;
                     self.refresh()?;
                 }
                 Mode::Command => {
+                    terminal::disable_raw_mode()?;
                     self.command()?;
                     self.refresh()?;
                 }
                 Mode::Quit => {
+                    terminal::disable_raw_mode()?;
                     self.quit()?;
 
                     break;
@@ -61,16 +69,26 @@ impl Session {
     }
 
     fn navigate(&mut self) -> io::Result<()> {
-        terminal::enable_raw_mode()?;
-
-        self.print()?;
+        self.refresh()?;
 
         self.term.execute(cursor::MoveTo(
-            (self.sheet.accum_widths[self.sheet.active_pos.1] * self.sheet.tab_size)
+            ((self.sheet.accum_widths[self.pos.0] - self.sheet.accum_widths[self.corner.0])
+                * self.sheet.tab_size)
                 .try_into()
                 .unwrap(),
-            self.sheet.active_pos.0.try_into().unwrap(),
+            (self.pos.1 - self.corner.1).try_into().unwrap(),
         ))?;
+
+        let buf = match self.sheet.units.get(&self.pos) {
+            Some(unit) => unit.content.to_owned(),
+            None => String::new(),
+        };
+        execute!(
+            self.term,
+            SetAttribute(style::Attribute::Reverse),
+            Print(&buf),
+            ResetColor,
+        )?;
 
         if let Event::Key(event) = event::read()? {
             match event {
@@ -81,7 +99,9 @@ impl Session {
                     code: KeyCode::Enter,
                     modifiers: KeyModifiers::SHIFT,
                     ..
-                } => self.sheet.move_checked(Direction::Up)?,
+                } => {
+                    self.move_cursor_by(0, -1)?;
+                }
                 KeyEvent {
                     code: KeyCode::Left,
                     ..
@@ -90,7 +110,9 @@ impl Session {
                     code: KeyCode::Tab,
                     modifiers: KeyModifiers::SHIFT,
                     ..
-                } => self.sheet.move_checked(Direction::Left)?,
+                } => {
+                    self.move_cursor_by(-1, 0)?;
+                }
                 KeyEvent {
                     code: KeyCode::Down,
                     ..
@@ -98,34 +120,62 @@ impl Session {
                 | KeyEvent {
                     code: KeyCode::Enter,
                     ..
-                } => self.sheet.move_checked(Direction::Down)?,
+                } => {
+                    self.move_cursor_by(0, 1)?;
+                }
                 KeyEvent {
                     code: KeyCode::Right,
                     ..
                 }
                 | KeyEvent {
                     code: KeyCode::Tab, ..
-                } => self.sheet.move_checked(Direction::Right)?,
+                } => {
+                    self.move_cursor_by(1, 0)?;
+                }
+                KeyEvent {
+                    code: KeyCode::PageDown,
+                    ..
+                } => {}
 
                 KeyEvent {
                     code: KeyCode::Char(':'),
                     ..
-                } => self.mode = Mode::Command,
+                } => {
+                    self.mode = Mode::Command;
+                }
                 KeyEvent {
                     code: KeyCode::Esc, ..
-                } => self.mode = Mode::Quit,
+                } => {
+                    self.mode = Mode::Quit;
+                }
 
-                _ => self.mode = Mode::Edit,
+                _ => {
+                    self.mode = Mode::Edit;
+                }
             }
         }
 
         Ok(())
     }
 
-    fn modify(&mut self) -> io::Result<()> {
-        terminal::disable_raw_mode()?;
+    fn move_cursor_by(&mut self, x: isize, y: isize) -> io::Result<()> {
+        let size = terminal::size()?;
 
-        let mut buf = match self.sheet.units.get(&self.sheet.active_pos) {
+        self.pos.0 = self.pos.0.saturating_add_signed(x);
+        self.pos.1 = self.pos.1.saturating_add_signed(y);
+
+        if !(self.corner.0 <= self.pos.0 && self.pos.0 < self.corner.0 + size.0 as usize - 1) {
+            self.corner.0 = self.corner.0.saturating_add_signed(x);
+        }
+        if !(self.corner.1 <= self.pos.1 && self.pos.1 < self.corner.1 + size.1 as usize - 1) {
+            self.corner.1 = self.corner.1.saturating_add_signed(y);
+        }
+
+        Ok(())
+    }
+
+    fn modify(&mut self) -> io::Result<()> {
+        let mut buf = match self.sheet.units.get(&self.pos) {
             Some(unit) => unit.content.to_owned(),
             None => String::new(),
         };
@@ -139,7 +189,7 @@ impl Session {
 
         self.sheet
             .units
-            .entry(self.sheet.active_pos)
+            .entry(self.pos)
             .and_modify(|unit| {
                 unit.content = buf.trim().to_owned();
             })
@@ -153,23 +203,20 @@ impl Session {
     }
 
     fn command(&mut self) -> io::Result<()> {
-        terminal::disable_raw_mode()?;
-
-        self.term.execute(cursor::MoveTo(0, 0))?;
+        self.term
+            .execute(cursor::MoveTo(0, terminal::size().unwrap().1 - 1))?;
+        print!(":");
+        self.term.flush()?;
 
         let mut command = String::new();
         io::stdin().read_line(&mut command)?;
 
-        self.parse_command(&command)?;
-
-        self.mode = Mode::Navigate;
+        self.parse_command(&command.trim())?;
 
         Ok(())
     }
 
     fn quit(&mut self) -> io::Result<()> {
-        terminal::disable_raw_mode()?;
-
         execute!(self.term, terminal::LeaveAlternateScreen)?;
 
         Ok(())
@@ -177,11 +224,17 @@ impl Session {
 
     fn print(&mut self) -> io::Result<()> {
         for unit in &self.sheet.units {
+            if !(self.corner.1 <= unit.0 .1
+                && unit.0 .1 < self.corner.1 + terminal::size().unwrap().1 as usize - 1)
+            {
+                continue;
+            }
+            let col = (self.sheet.accum_widths[unit.0 .0.saturating_sub(self.corner.0)])
+                * self.sheet.tab_size;
+            let row = unit.0 .1.saturating_sub(self.corner.1);
             self.term.execute(cursor::MoveTo(
-                (self.sheet.accum_widths[unit.0 .1] * self.sheet.tab_size)
-                    .try_into()
-                    .unwrap(),
-                (unit.0 .0).try_into().unwrap(),
+                col.try_into().unwrap(),
+                row.try_into().unwrap(),
             ))?;
             print!("{:1}", unit.1.content);
         }
@@ -190,8 +243,6 @@ impl Session {
     }
 
     fn refresh(&mut self) -> io::Result<()> {
-        terminal::disable_raw_mode()?;
-
         execute!(self.term, terminal::Clear(terminal::ClearType::All))?;
 
         self.print()?;
@@ -200,11 +251,17 @@ impl Session {
     }
 
     fn parse_command(&mut self, command: &str) -> io::Result<()> {
-        if command.is_empty() {
-            return Ok(());
+        match command {
+            "w" => {
+                self.save()?;
+            }
+            "q" => {
+                self.mode = Mode::Quit;
+            }
+            _ => {
+                self.mode = Mode::Navigate;
+            }
         }
-
-        self.save()?;
 
         Ok(())
     }
@@ -224,10 +281,10 @@ impl Session {
 
         for row in 0..self.sheet.rows {
             for col in 0..self.sheet.cols {
-                if let Some(u) = self.sheet.units.get(&(row, col)) {
+                if let Some(u) = self.sheet.units.get(&(col, row)) {
                     file.write_all(u.content.as_bytes())?;
 
-                    let width = u.content.len() / self.sheet.tab_size + 1;
+                    let width = UnicodeWidthStr::width(u.content.as_str()) / self.sheet.tab_size + 1;
                     file.write_all(&b"\t".repeat(self.sheet.widths[col] - width + 1))?;
                 };
             }
@@ -248,54 +305,31 @@ impl Config {
     }
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 struct Sheet {
     units: HashMap<(usize, usize), Unit>,
     rows: usize,
     cols: usize,
     tab_size: usize,
-    active_pos: (usize, usize),
     widths: Vec<usize>,
     accum_widths: Vec<usize>,
 }
 
 impl Sheet {
-    fn new() -> Self {
+    fn new(config: Config) -> Self {
         Self {
             units: HashMap::new(),
             rows: 1,
             cols: 1,
-            tab_size: 8,
-            active_pos: (0, 0),
+            tab_size: config.tab_size,
             widths: vec![],
             accum_widths: vec![0],
         }
-    }
-
-    fn move_checked(&mut self, dir: Direction) -> io::Result<()> {
-        match dir {
-            Direction::Down => {
-                if self.active_pos.0 != self.rows - 1 {
-                    self.active_pos.0 += 1
-                }
-            }
-            Direction::Right => {
-                if self.active_pos.1 != self.cols - 1 {
-                    self.active_pos.1 += 1
-                }
-            }
-            Direction::Up => {
-                if self.active_pos.0 != 0 {
-                    self.active_pos.0 -= 1
-                }
-            }
-            Direction::Left => {
-                if self.active_pos.1 != 0 {
-                    self.active_pos.1 -= 1
-                }
-            }
-        }
-
-        Ok(())
     }
 
     fn from_file(path: &str, config: Config) -> io::Result<Self> {
@@ -318,7 +352,7 @@ impl Sheet {
         }
 
         let mut units_map = HashMap::new();
-        let (widths, accum_widths) = get_col_widths_from_contents(&contents, config.tab_size);
+        let (widths, accum_widths) = get_widths(&contents, config.tab_size);
 
         let rows = contents.len();
         let cols = widths.len();
@@ -329,14 +363,14 @@ impl Sheet {
             let mut items = line.into_iter();
             while let Some(s) = items.next() {
                 units_map.insert(
-                    (row, col),
+                    (col, row),
                     Unit {
                         content: String::from(s),
                     },
                 );
 
                 let width = UnicodeWidthStr::width(s) / config.tab_size + 1;
-                let diff = widths[col].checked_sub(width).unwrap_or_default();
+                let diff = widths[col].saturating_sub(width);
                 if diff > 0 {
                     items.nth(diff - 1);
                 }
@@ -352,17 +386,13 @@ impl Sheet {
             rows,
             cols,
             tab_size: config.tab_size,
-            active_pos: (0, 0),
             widths,
             accum_widths,
         }
     }
 }
 
-fn get_col_widths_from_contents(
-    contents: &[Vec<&str>],
-    tab_size: usize,
-) -> (Vec<usize>, Vec<usize>) {
+fn get_widths(contents: &[Vec<&str>], tab_size: usize) -> (Vec<usize>, Vec<usize>) {
     let mut widths: Vec<usize> = vec![];
 
     for line in contents {
@@ -382,7 +412,7 @@ fn get_col_widths_from_contents(
             }
 
             while let Some(prev_width) = widths.get(index) {
-                if width.checked_sub(*prev_width).unwrap_or_default() > 0 {
+                if width.saturating_sub(*prev_width) > 0 {
                     if index == widths.len() - 1 {
                         widths[index] = width;
                     } else {
@@ -418,11 +448,4 @@ enum Mode {
     Edit,
     Command,
     Quit,
-}
-
-enum Direction {
-    Down,
-    Right,
-    Up,
-    Left,
 }
