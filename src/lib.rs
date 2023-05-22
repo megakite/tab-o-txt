@@ -1,25 +1,28 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, stdout, Read, Stdout, Write};
+use std::io::{self, stdin, stdout, Read, Write};
+use std::ops::Add;
 
+use crossterm::cursor::MoveLeft;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::style::{Print, ResetColor, SetAttribute};
-use crossterm::{cursor, event, execute, style, terminal, ExecutableCommand};
+use crossterm::style::{Attribute, Print, ResetColor, SetAttribute};
+use crossterm::terminal::{Clear, ClearType};
+use crossterm::{cursor, event, execute, terminal};
 
 use unicode_width::UnicodeWidthStr;
 
 pub struct Session {
-    term: Stdout,
     mode: Mode,
     file_path: Option<String>,
     sheet: Sheet,
+    /// Current cursor position. Zero-indexed. Represented in `(col, row)`.
     pos: (usize, usize),
+    /// From where the table starts to be drawn. Zero-indexed. Represented in `(col, row)`.
     corner: (usize, usize),
 }
 
 impl Session {
     pub fn new(config: Config, args: &[String]) -> io::Result<Self> {
-        let term = stdout();
         let mode = Mode::Navigate;
         let file_path = args.get(1).cloned();
         let sheet = match &file_path {
@@ -28,7 +31,6 @@ impl Session {
         };
 
         Ok(Self {
-            term,
             mode,
             file_path,
             sheet,
@@ -38,7 +40,7 @@ impl Session {
     }
 
     pub fn run(&mut self) -> io::Result<()> {
-        execute!(self.term, terminal::EnterAlternateScreen)?;
+        execute!(stdout(), terminal::EnterAlternateScreen)?;
 
         loop {
             match self.mode {
@@ -47,14 +49,12 @@ impl Session {
                     self.navigate()?;
                 }
                 Mode::Edit => {
-                    terminal::disable_raw_mode()?;
-                    self.modify()?;
-                    self.refresh()?;
+                    terminal::enable_raw_mode()?;
+                    self.edit()?;
                 }
                 Mode::Command => {
                     terminal::disable_raw_mode()?;
                     self.command()?;
-                    self.refresh()?;
                 }
                 Mode::Quit => {
                     terminal::disable_raw_mode()?;
@@ -71,24 +71,23 @@ impl Session {
     fn navigate(&mut self) -> io::Result<()> {
         self.refresh()?;
 
-        self.term.execute(cursor::MoveTo(
-            ((self.sheet.accum_widths[self.pos.0] - self.sheet.accum_widths[self.corner.0])
-                * self.sheet.tab_size)
-                .try_into()
-                .unwrap(),
-            (self.pos.1 - self.corner.1).try_into().unwrap(),
-        ))?;
-
-        let buf = match self.sheet.units.get(&self.pos) {
-            Some(unit) => unit.content.to_owned(),
-            None => String::new(),
-        };
         execute!(
-            self.term,
-            SetAttribute(style::Attribute::Reverse),
-            Print(&buf),
-            ResetColor,
+            stdout(),
+            cursor::MoveTo(
+                ((self.sheet.accum_widths[self.pos.0] - self.sheet.accum_widths[self.corner.0])
+                    * self.sheet.tab_size) as u16,
+                (self.pos.1 - self.corner.1) as u16,
+            )
         )?;
+
+        if let Some(u) = self.sheet.units.get(&self.pos) {
+            execute!(
+                stdout(),
+                SetAttribute(Attribute::Reverse),
+                Print(&u.content),
+                ResetColor,
+            )?;
+        };
 
         if let Event::Key(event) = event::read()? {
             match event {
@@ -135,7 +134,15 @@ impl Session {
                 KeyEvent {
                     code: KeyCode::PageDown,
                     ..
-                } => {}
+                } => {
+                    self.move_cursor_by(0, (terminal::size().unwrap().1 - 1) as isize)?;
+                }
+                KeyEvent {
+                    code: KeyCode::PageUp,
+                    ..
+                } => {
+                    self.move_cursor_by(0, -((terminal::size().unwrap().1 - 1) as isize))?;
+                }
 
                 KeyEvent {
                     code: KeyCode::Char(':'),
@@ -143,14 +150,22 @@ impl Session {
                 } => {
                     self.mode = Mode::Command;
                 }
+
                 KeyEvent {
                     code: KeyCode::Esc, ..
                 } => {
                     self.mode = Mode::Quit;
                 }
 
-                _ => {
+                KeyEvent {
+                    code: KeyCode::F(2),
+                    ..
+                } => {
                     self.mode = Mode::Edit;
+                }
+
+                _ => {
+                    todo!()
                 }
             }
         }
@@ -161,41 +176,76 @@ impl Session {
     fn move_cursor_by(&mut self, x: isize, y: isize) -> io::Result<()> {
         let size = terminal::size()?;
 
-        self.pos.0 = self.pos.0.saturating_add_signed(x);
-        self.pos.1 = self.pos.1.saturating_add_signed(y);
+        self.pos.0 = self
+            .pos
+            .0
+            .saturating_add_signed(x)
+            .clamp(0, self.sheet.size.0);
+        self.pos.1 = self
+            .pos
+            .1
+            .saturating_add_signed(y)
+            .clamp(0, self.sheet.size.1);
 
-        if !(self.corner.0 <= self.pos.0 && self.pos.0 < self.corner.0 + size.0 as usize - 1) {
+        if !is_in_offset_bounds(
+            self.sheet.accum_widths[self.pos.0],
+            self.sheet.accum_widths[self.corner.0],
+            (size.0 as usize - 1) / self.sheet.tab_size,
+        ) {
             self.corner.0 = self.corner.0.saturating_add_signed(x);
         }
-        if !(self.corner.1 <= self.pos.1 && self.pos.1 < self.corner.1 + size.1 as usize - 1) {
+        if !is_in_offset_bounds(self.pos.1, self.corner.1, size.1 as usize - 1) {
             self.corner.1 = self.corner.1.saturating_add_signed(y);
         }
 
         Ok(())
     }
 
-    fn modify(&mut self) -> io::Result<()> {
+    fn edit(&mut self) -> io::Result<()> {
         let mut buf = match self.sheet.units.get(&self.pos) {
             Some(unit) => unit.content.to_owned(),
             None => String::new(),
         };
-        execute!(
-            self.term,
-            SetAttribute(style::Attribute::Reverse),
-            Print(&buf),
-        )?;
-        io::stdin().read_line(&mut buf)?;
-        execute!(self.term, ResetColor)?;
+        buf = read_line_initial_text(&buf)?;
 
-        self.sheet
-            .units
-            .entry(self.pos)
-            .and_modify(|unit| {
-                unit.content = buf.trim().to_owned();
-            })
-            .or_insert(Unit {
-                content: buf.trim().to_owned(),
-            });
+        if buf.is_empty() {
+            self.sheet.units.remove(&self.pos);
+        } else {
+            self.sheet
+                .units
+                .entry(self.pos)
+                .and_modify(|mut unit| {
+                    unit.content = buf.trim().to_owned();
+                })
+                .or_insert_with(|| Unit::from(buf.trim()));
+
+            self.sheet.size.0 = self.sheet.size.0.max(self.pos.0 + 1);
+            self.sheet.size.1 = self.sheet.size.1.max(self.pos.1 + 1);
+        }
+
+        if let Some(n) = self.sheet.widths.get_mut(self.pos.0) {
+            let max_width_of_current_col = self
+                .sheet
+                .units
+                .iter()
+                .filter(|u| u.0 .0 == self.pos.0)
+                .map(|u| UnicodeWidthStr::width(u.1.content.as_str()) / self.sheet.tab_size + 1)
+                .max()
+                .unwrap_or(1);
+            if *n != max_width_of_current_col {
+                *n = max_width_of_current_col;
+            }
+        } else {
+            let width = UnicodeWidthStr::width(buf.as_str()) / self.sheet.tab_size + 1;
+            self.sheet.widths.push(width);
+        }
+
+        let mut new_accum_widths = vec![0];
+        for i in 0..self.sheet.widths.len() {
+            new_accum_widths.push(self.sheet.widths[i] + new_accum_widths[i]);
+        }
+
+        self.sheet.accum_widths = new_accum_widths;
 
         self.mode = Mode::Navigate;
 
@@ -203,63 +253,81 @@ impl Session {
     }
 
     fn command(&mut self) -> io::Result<()> {
-        self.term
-            .execute(cursor::MoveTo(0, terminal::size().unwrap().1 - 1))?;
+        execute!(stdout(), cursor::MoveTo(0, terminal::size().unwrap().1 - 1))?;
         print!(":");
-        self.term.flush()?;
+        stdout().flush()?;
 
         let mut command = String::new();
-        io::stdin().read_line(&mut command)?;
+        stdin().read_line(&mut command)?;
 
-        self.parse_command(&command.trim())?;
+        self.parse_command(command.trim())?;
 
         Ok(())
     }
 
     fn quit(&mut self) -> io::Result<()> {
-        execute!(self.term, terminal::LeaveAlternateScreen)?;
+        execute!(stdout(), terminal::LeaveAlternateScreen)?;
 
         Ok(())
     }
 
     fn print(&mut self) -> io::Result<()> {
+        let size = terminal::size()?;
+
         for unit in &self.sheet.units {
-            if !(self.corner.1 <= unit.0 .1
-                && unit.0 .1 < self.corner.1 + terminal::size().unwrap().1 as usize - 1)
+            if !(is_in_offset_bounds(
+                unit.0 .0,
+                self.corner.0,
+                (size.0 as usize - 1) / self.sheet.tab_size,
+            ) && is_in_offset_bounds(unit.0 .1, self.corner.1, size.1 as usize - 1))
             {
                 continue;
             }
-            let col = (self.sheet.accum_widths[unit.0 .0.saturating_sub(self.corner.0)])
+
+            let col = self.sheet.accum_widths[unit.0 .0]
+                .saturating_sub(self.sheet.accum_widths[self.corner.0])
                 * self.sheet.tab_size;
             let row = unit.0 .1.saturating_sub(self.corner.1);
-            self.term.execute(cursor::MoveTo(
-                col.try_into().unwrap(),
-                row.try_into().unwrap(),
-            ))?;
-            print!("{:1}", unit.1.content);
+
+            execute!(
+                stdout(),
+                cursor::MoveTo(col as u16, row as u16),
+                Print(&unit.1.content),
+            )?;
         }
 
         Ok(())
     }
 
     fn refresh(&mut self) -> io::Result<()> {
-        execute!(self.term, terminal::Clear(terminal::ClearType::All))?;
+        execute!(
+            stdout(),
+            // Clear(ClearType::All),
+            Clear(ClearType::FromCursorUp),
+            Clear(ClearType::CurrentLine),
+            Clear(ClearType::FromCursorDown),
+        )?;
 
         self.print()?;
 
         Ok(())
     }
 
-    fn parse_command(&mut self, command: &str) -> io::Result<()> {
-        match command {
-            "w" => {
-                self.save()?;
-            }
-            "q" => {
-                self.mode = Mode::Quit;
-            }
-            _ => {
-                self.mode = Mode::Navigate;
+    fn parse_command(&mut self, cmd: &str) -> io::Result<()> {
+        let mut iter = cmd.chars();
+
+        while let Some(c) = iter.next() {
+            match c {
+                'w' => {
+                    self.save()?;
+                    self.mode = Mode::Navigate;
+                }
+                'q' => {
+                    self.mode = Mode::Quit;
+                }
+                _ => {
+                    self.mode = Mode::Navigate;
+                }
             }
         }
 
@@ -271,22 +339,25 @@ impl Session {
             Some(fp) => fp.to_owned(),
             None => {
                 let mut buf = String::new();
-                io::stdin().read_to_string(&mut buf)?;
-
+                stdin().read_to_string(&mut buf)?;
                 buf
             }
         };
-
         let mut file = File::options().create(true).write(true).open(file_path)?;
 
-        for row in 0..self.sheet.rows {
-            for col in 0..self.sheet.cols {
+        for row in 0..self.sheet.size.1 {
+            let mut count: usize = 0;
+            for col in 0..self.sheet.size.0 {
                 if let Some(u) = self.sheet.units.get(&(col, row)) {
+                    file.write_all(&b"\t".repeat(count))?;
                     file.write_all(u.content.as_bytes())?;
 
-                    let width = UnicodeWidthStr::width(u.content.as_str()) / self.sheet.tab_size + 1;
-                    file.write_all(&b"\t".repeat(self.sheet.widths[col] - width + 1))?;
-                };
+                    let width =
+                        UnicodeWidthStr::width(u.content.as_str()) / self.sheet.tab_size + 1;
+                    count = 1 + (self.sheet.widths[col] - width);
+                } else {
+                    count += self.sheet.widths[col];
+                }
             }
             file.write_all(b"\n")?;
         }
@@ -313,8 +384,8 @@ impl Default for Config {
 
 struct Sheet {
     units: HashMap<(usize, usize), Unit>,
-    rows: usize,
-    cols: usize,
+    /// Size of the sheet. Represented in `(col, row)`.
+    size: (usize, usize),
     tab_size: usize,
     widths: Vec<usize>,
     accum_widths: Vec<usize>,
@@ -324,8 +395,7 @@ impl Sheet {
     fn new(config: Config) -> Self {
         Self {
             units: HashMap::new(),
-            rows: 1,
-            cols: 1,
+            size: (1, 1),
             tab_size: config.tab_size,
             widths: vec![],
             accum_widths: vec![0],
@@ -362,12 +432,9 @@ impl Sheet {
             let mut col: usize = 0;
             let mut items = line.into_iter();
             while let Some(s) = items.next() {
-                units_map.insert(
-                    (col, row),
-                    Unit {
-                        content: String::from(s),
-                    },
-                );
+                if !s.is_empty() {
+                    units_map.insert((col, row), Unit::from(s));
+                }
 
                 let width = UnicodeWidthStr::width(s) / config.tab_size + 1;
                 let diff = widths[col].saturating_sub(width);
@@ -383,8 +450,7 @@ impl Sheet {
 
         Self {
             units: units_map,
-            rows,
-            cols,
+            size: (cols, rows),
             tab_size: config.tab_size,
             widths,
             accum_widths,
@@ -392,6 +458,7 @@ impl Sheet {
     }
 }
 
+/// Get column widths and accumulated widths from a 2-D vector.
 fn get_widths(contents: &[Vec<&str>], tab_size: usize) -> (Vec<usize>, Vec<usize>) {
     let mut widths: Vec<usize> = vec![];
 
@@ -399,11 +466,11 @@ fn get_widths(contents: &[Vec<&str>], tab_size: usize) -> (Vec<usize>, Vec<usize
         let mut index: usize = 0;
         let mut items = line.iter().peekable();
 
-        'l: while let Some(item) = items.next() {
-            let mut width: usize = UnicodeWidthStr::width(*item) / tab_size + 1;
+        'outer: while let Some(&item) = items.next() {
+            let mut width: usize = UnicodeWidthStr::width(item) / tab_size + 1;
 
-            while let Some(following) = items.peek() {
-                if (**following).is_empty() {
+            while let Some(&&following) = items.peek() {
+                if following.is_empty() {
                     items.next();
                     width += 1;
                 } else {
@@ -411,17 +478,28 @@ fn get_widths(contents: &[Vec<&str>], tab_size: usize) -> (Vec<usize>, Vec<usize
                 }
             }
 
-            while let Some(prev_width) = widths.get(index) {
-                if width.saturating_sub(*prev_width) > 0 {
-                    if index == widths.len() - 1 {
-                        widths[index] = width;
+            while let Some(&prev_width) = widths.get(index) {
+                let (value, overflow) = width.overflowing_sub(prev_width);
+
+                if !overflow {
+                    if value > 0 {
+                        if index == widths.len() - 1 {
+                            widths[index] = width;
+                        } else {
+                            width -= prev_width;
+                            index += 1;
+                        }
                     } else {
-                        width -= prev_width;
                         index += 1;
-                    }
+                        continue 'outer;
+                    } 
                 } else {
+                    if items.peek().is_some() {
+                        widths[index] = width;
+                        widths.insert(index + 1, prev_width - width);
+                    }
                     index += 1;
-                    continue 'l;
+                    continue 'outer;
                 }
             }
 
@@ -438,12 +516,94 @@ fn get_widths(contents: &[Vec<&str>], tab_size: usize) -> (Vec<usize>, Vec<usize
     (widths, accum_widths)
 }
 
+/// Check if given `val` lies in `lbd..lbd + ofs`.
+fn is_in_offset_bounds<T>(val: T, lbd: T, ofs: T) -> bool
+where
+    T: PartialOrd + Add<Output = T>,
+{
+    lbd <= val && val < lbd + ofs
+}
+
+fn read_line_initial_text(initial: &str) -> io::Result<String> {
+    if initial.is_empty() {
+        execute!(stdout(), Clear(ClearType::UntilNewLine))?;
+    } else {
+        execute!(
+            stdout(),
+            MoveLeft(initial.len() as u16),
+            Clear(ClearType::UntilNewLine),
+            Print(initial),
+        )?;
+    }
+
+    let mut chars: Vec<char> = initial.chars().collect();
+
+    loop {
+        if let Event::Key(event) = event::read()? {
+            match event {
+                KeyEvent {
+                    code: KeyCode::Backspace,
+                    ..
+                } => {
+                    if chars.pop().is_some() {
+                        execute!(stdout(), MoveLeft(1), Clear(ClearType::UntilNewLine))?;
+                    }
+                }
+                KeyEvent {
+                    code: KeyCode::Char(c),
+                    ..
+                } => {
+                    chars.push(c);
+                    let mut bytes_char = [0; 4];
+                    c.encode_utf8(&mut bytes_char);
+
+                    print!("{}", c.encode_utf8(&mut bytes_char));
+                    stdout().flush()?;
+                }
+                KeyEvent {
+                    code: KeyCode::Enter,
+                    ..
+                } => {
+                    break;
+                }
+                _ => (),
+            }
+        }
+    }
+
+    Ok(chars.iter().collect())
+}
+
 #[derive(Debug)]
 struct Unit {
     content: String,
 }
 
+impl Unit {
+    fn new() -> Self {
+        Unit {
+            content: String::new(),
+        }
+    }
+}
+
+impl From<&str> for Unit {
+    fn from(value: &str) -> Self {
+        Unit {
+            content: value.to_owned(),
+        }
+    }
+}
+
+impl Default for Unit {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Default)]
 enum Mode {
+    #[default]
     Navigate,
     Edit,
     Command,

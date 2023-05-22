@@ -4,5 +4,7 @@
     "lldb.dereferencePointers": true,
     "lldb.consoleMode": "commands",
     "[yaml]": {
+    },
+    "[plaintext]": {
     }
 }

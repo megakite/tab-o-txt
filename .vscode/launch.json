@@ -44,7 +44,7 @@
                     "kind": "bin"
                 }
             },
-            "args": ["txt/album_list.txt"],
+            "args": ["txt/test8_2.txt"],
             "cwd": "${workspaceFolder}"
         },
         {
