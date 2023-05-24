@@ -1,7 +1,7 @@
 # tab-o-txt
 
-Plain text sheet parser & CLI editor.\
-用于纯文本表格的解析器和命令行界面编辑器。
+Plain text spreadsheet parser & CLI editor.\
+用于纯文本表格的解析器，以及命令行界面编辑器。
 
 ## Usage 用法
 Use the parser:\
