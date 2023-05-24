@@ -1,10 +1,10 @@
 # tab-o-txt
 
-Plain text sheet parser & CLI editor.
+Plain text sheet parser & CLI editor.\
 用于纯文本表格的解析器和命令行界面编辑器。
 
 ## Usage 用法
-Use the parser:
+Use the parser:\
 使用解析器：
 ```rust
 use tab_o_txt::sheet::Sheet;
@@ -18,7 +18,7 @@ fn main() {
     assert_eq!("example", sheet.content_at((1, 1)));
 }
 ```
-Use the CLI editor:
+Use the CLI editor:\
 使用命令行界面编辑器：
 ```sh
 tab-o-txt [file-name]
