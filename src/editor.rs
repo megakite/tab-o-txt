@@ -33,15 +33,15 @@ impl Editor {
         }
     }
 
-    pub fn from(config: Config, args: &[String]) -> io::Result<Self> {
+    pub fn from(args: &[String]) -> io::Result<Self> {
         let file_path = args.get(1).cloned();
         let sheet = match &file_path {
-            Some(f) => Sheet::from_file(f, config)?,
-            None => Sheet::from(config),
+            Some(f) => Sheet::from_file(f)?,
+            None => Sheet::new(),
         };
 
         Ok(Self {
-            mode: Mode::Navigate, 
+            mode: Mode::Navigate,
             file_path,
             sheet,
             pos: (0, 0),
@@ -336,22 +336,6 @@ impl Editor {
         }
 
         Ok(())
-    }
-}
-
-pub struct Config {
-    pub tab_size: usize,
-}
-
-impl Config {
-    pub fn new() -> Self {
-        Self { tab_size: 8 }
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

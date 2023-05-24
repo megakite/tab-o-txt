@@ -6,8 +6,6 @@ use std::{
 
 use unicode_width::UnicodeWidthStr;
 
-use crate::editor::Config;
-
 pub struct Sheet {
     units: HashMap<(usize, usize), Unit>,
     /// Size of the sheet. Represented in `(col, row)`.
@@ -17,28 +15,20 @@ pub struct Sheet {
     accum_widths: Vec<usize>,
 }
 
+const DEFAULT_TAB_SIZE: usize = 8;
+
 impl Sheet {
     pub fn new() -> Self {
         Self {
             units: HashMap::new(),
             size: (1, 1),
-            tab_size: 8,
+            tab_size: DEFAULT_TAB_SIZE,
             widths: vec![0],
             accum_widths: vec![0, 1],
         }
     }
 
-    pub fn from(config: Config) -> Self {
-        Self {
-            units: HashMap::new(),
-            size: (1, 1),
-            tab_size: config.tab_size,
-            widths: vec![0],
-            accum_widths: vec![0, 1],
-        }
-    }
-
-    pub fn from_file(path: &str, config: Config) -> io::Result<Self> {
+    pub fn from_file(path: &str) -> io::Result<Self> {
         let mut buf = String::new();
         File::options()
             .read(true)
@@ -46,7 +36,7 @@ impl Sheet {
             .open(path)?
             .read_to_string(&mut buf)?;
 
-        Ok(Self::from_str(&buf, config))
+        Ok(Self::from_str(&buf))
     }
 
     pub fn tab_size(&self) -> usize {
@@ -76,8 +66,8 @@ impl Sheet {
         )
     }
 
-    fn from_str(buf: &str, config: Config) -> Self {
-        let widths = Self::get_widths(buf, config.tab_size);
+    pub fn from_str(buf: &str) -> Self {
+        let widths = Self::get_widths(buf, DEFAULT_TAB_SIZE);
         let mut accum_widths = vec![0];
         for i in 0..widths.len() {
             accum_widths.push(widths[i] + accum_widths[i]);
@@ -94,7 +84,7 @@ impl Sheet {
                     units_map.insert((col, row), Unit::from(s));
                 }
 
-                let width = Self::measure_width(s, config.tab_size);
+                let width = Self::measure_width(s, DEFAULT_TAB_SIZE);
                 let diff = widths[col].saturating_sub(width);
                 if diff > 0 {
                     items.nth(diff - 1);
@@ -109,7 +99,7 @@ impl Sheet {
         Self {
             units: units_map,
             size: (widths.len(), row),
-            tab_size: config.tab_size,
+            tab_size: DEFAULT_TAB_SIZE,
             widths,
             accum_widths,
         }
