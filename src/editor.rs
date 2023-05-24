@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, stdin, stdout, Read, Write};
+use std::io::{self, stdin, stdout, Write};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::style::{Attribute, Print, ResetColor, SetAttribute};
@@ -23,16 +23,25 @@ pub struct Editor {
 }
 
 impl Editor {
-    pub fn new(config: Config, args: &[String]) -> io::Result<Self> {
-        let mode = Mode::Navigate;
+    pub fn new() -> Self {
+        Self {
+            mode: Mode::Navigate,
+            file_path: None,
+            sheet: Sheet::new(),
+            pos: (0, 0),
+            corner: (0, 0),
+        }
+    }
+
+    pub fn from(config: Config, args: &[String]) -> io::Result<Self> {
         let file_path = args.get(1).cloned();
         let sheet = match &file_path {
             Some(f) => Sheet::from_file(f, config)?,
-            None => Sheet::new(config),
+            None => Sheet::from(config),
         };
 
         Ok(Self {
-            mode,
+            mode: Mode::Navigate, 
             file_path,
             sheet,
             pos: (0, 0),
@@ -166,9 +175,7 @@ impl Editor {
                     self.mode = Mode::Edit;
                 }
 
-                _ => {
-                    todo!()
-                }
+                _ => (),
             }
         }
 
@@ -218,9 +225,11 @@ impl Editor {
     }
 
     fn command(&mut self) -> io::Result<()> {
-        execute!(stdout(), cursor::MoveTo(0, terminal::size().unwrap().1 - 1))?;
-        print!(":");
-        stdout().flush()?;
+        execute!(
+            stdout(),
+            cursor::MoveTo(0, terminal::size().unwrap().1 - 1),
+            Print(":")
+        )?;
 
         let mut command = String::new();
         stdin().read_line(&mut command)?;
@@ -297,9 +306,11 @@ impl Editor {
         let file_path = match &self.file_path {
             Some(fp) => fp.to_owned(),
             None => {
+                execute!(stdout(), Print("New file. Save as: "))?;
+
                 let mut buf = String::new();
-                stdin().read_to_string(&mut buf)?;
-                buf
+                stdin().read_line(&mut buf)?;
+                buf.trim().to_owned()
             }
         };
         let mut file = File::options()

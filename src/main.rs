@@ -7,7 +7,7 @@ fn main() {
     let config = Config::new();
 
     let args: Vec<_> = env::args().collect();
-    let mut session = Editor::new(config, &args).unwrap_or_else(|err| {
+    let mut session = Editor::from(config, &args).unwrap_or_else(|err| {
         println!("Error when starting editor: {}", err);
         process::exit(1);
     });

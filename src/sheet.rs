@@ -18,13 +18,23 @@ pub struct Sheet {
 }
 
 impl Sheet {
-    pub fn new(config: Config) -> Self {
+    pub fn new() -> Self {
+        Self {
+            units: HashMap::new(),
+            size: (1, 1),
+            tab_size: 8,
+            widths: vec![0],
+            accum_widths: vec![0, 1],
+        }
+    }
+
+    pub fn from(config: Config) -> Self {
         Self {
             units: HashMap::new(),
             size: (1, 1),
             tab_size: config.tab_size,
-            widths: vec![],
-            accum_widths: vec![0],
+            widths: vec![0],
+            accum_widths: vec![0, 1],
         }
     }
 
@@ -265,6 +275,12 @@ impl Sheet {
         }
 
         widths
+    }
+}
+
+impl Default for Sheet {
+    fn default() -> Self {
+        Sheet::new()
     }
 }
 
