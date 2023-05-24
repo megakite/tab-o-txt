@@ -1,3 +1,25 @@
-# tab-o-txt (WIP)
+# tab-o-txt
 
-Pure-text sheet editor written in Rust.
+Plain text sheet parser & CLI editor.
+用于纯文本表格的解析器和命令行界面编辑器。
+
+## Usage 用法
+Use the parser:
+使用解析器：
+```rust
+use tab_o_txt::sheet::Sheet;
+
+fn main() {
+    let txt =
+"This\tis\tan\r\n
+\texample\tof\ta\tplain-text\tsheet\r\n";
+    let sheet = Sheet::from_str(txt);
+
+    assert_eq!("example", sheet.content_at((1, 1)));
+}
+```
+Use the CLI editor:
+使用命令行界面编辑器：
+```sh
+tab-o-txt [file-name]
+```
