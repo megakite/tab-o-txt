@@ -6,5 +6,8 @@
     "[yaml]": {
     },
     "[plaintext]": {
-    }
+    },
+    "rust-analyzer.linkedProjects": [
+        ".\\Cargo.toml"
+    ],
 }
