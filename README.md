@@ -10,12 +10,12 @@ Use the parser:
 use tab_o_txt::sheet::Sheet;
 
 fn main() {
-    let txt =
-"This\tis\tan\r\n
-\texample\tof\ta\tplain-text\tsheet\r\n";
+    let txt = "This\tis\tan
+\texample\tof\ta\tplain-text
+\t\t\t\tspreadsheet";
     let sheet = Sheet::from_str(txt);
 
-    assert_eq!("example", sheet.content_at((1, 1)));
+    assert_eq!("example", sheet.content_at((1, 1)).unwrap());
 }
 ```
 Use the CLI editor:
