@@ -3,10 +3,6 @@
     "lldb.showDisassembly": "auto",
     "lldb.dereferencePointers": true,
     "lldb.consoleMode": "commands",
-    "[yaml]": {
-    },
-    "[plaintext]": {
-    },
     "rust-analyzer.linkedProjects": [
         ".\\Cargo.toml"
     ],
